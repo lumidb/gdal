@@ -216,6 +216,72 @@ fn test_create_copy() {
 }
 
 #[test]
+fn test_create_copy_with_progress_can_stop() {
+    let dataset = Dataset::open(fixture("tinymarble.tif")).unwrap();
+    let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+    let filename = "/vsimem/cancelled-copy.tif";
+    let mut reports = 0;
+    let result = dataset.create_copy_with_progress(&driver, filename, &Default::default(), |_| {
+        reports += 1;
+        false
+    });
+    assert!(reports > 0);
+    assert!(result.is_err());
+    let _ = unlink_mem_file(filename);
+}
+
+#[test]
+#[ignore]
+fn test_large_cog_progress_and_stop() {
+    let source = std::env::var("LUMIDB_TEST_COG_FILE").unwrap();
+    let dataset = Dataset::open(source).unwrap();
+    let driver = DriverManager::get_driver_by_name("COG").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let options = RasterCreationOptions::from_iter([
+        "COMPRESS=DEFLATE",
+        "NUM_THREADS=ALL_CPUS",
+        "BIGTIFF=YES",
+        "TARGET_SRS=EPSG:3857",
+    ]);
+    let mut last = std::time::Instant::now();
+    let mut max_gap = std::time::Duration::ZERO;
+    let mut reports = 0;
+    dataset
+        .create_copy_with_progress(&driver, dir.path().join("complete.tif"), &options, |_| {
+            max_gap = max_gap.max(last.elapsed());
+            last = std::time::Instant::now();
+            reports += 1;
+            true
+        })
+        .unwrap();
+    assert!(reports > 1);
+    println!("COG callbacks: {reports}, longest gap: {max_gap:?}");
+    assert!(
+        max_gap < std::time::Duration::from_secs(180),
+        "longest callback gap: {max_gap:?}"
+    );
+
+    let mut stopped_at = None;
+    let result = dataset.create_copy_with_progress(
+        &driver,
+        dir.path().join("stopped.tif"),
+        &options,
+        |progress| {
+            if progress >= 0.2 {
+                stopped_at = Some(std::time::Instant::now());
+                false
+            } else {
+                true
+            }
+        },
+    );
+    assert!(result.is_err());
+    let stop_delay = stopped_at.unwrap().elapsed();
+    println!("COG stop delay: {stop_delay:?}");
+    assert!(stop_delay < std::time::Duration::from_secs(30));
+}
+
+#[test]
 fn test_create_copy_with_options() {
     let dataset = Dataset::open(fixture("tinymarble.tif")).unwrap();
 

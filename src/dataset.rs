@@ -6,7 +6,6 @@ use std::{
 
 use gdal_sys::{CPLErr, GDALDatasetH, GDALMajorObjectH};
 
-use crate::cpl::CslStringList;
 use crate::errors::{GdalError, Result};
 use crate::options::DatasetOptions;
 use crate::raster::RasterCreationOptions;
@@ -253,31 +252,62 @@ impl Dataset {
         filename: P,
         options: &RasterCreationOptions,
     ) -> Result<Dataset> {
-        fn _create_copy(
-            ds: &Dataset,
-            driver: &Driver,
-            filename: &Path,
-            options: &CslStringList,
-        ) -> Result<Dataset> {
-            let c_filename = _path_to_c_string(filename)?;
+        self.create_copy_with_progress(driver, filename, options, |_| true)
+    }
 
-            let c_dataset = unsafe {
-                gdal_sys::GDALCreateCopy(
-                    driver.c_driver(),
-                    c_filename.as_ptr(),
-                    ds.c_dataset,
-                    0,
-                    options.as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                )
-            };
-            if c_dataset.is_null() {
-                return Err(_last_null_pointer_err("GDALCreateCopy"));
-            }
-            Ok(unsafe { Dataset::from_c_dataset(c_dataset) })
+    pub fn create_copy_with_progress<P: AsRef<Path>, F: FnMut(f64) -> bool>(
+        &self,
+        driver: &Driver,
+        filename: P,
+        options: &RasterCreationOptions,
+        mut callback: F,
+    ) -> Result<Dataset> {
+        struct Callback<'a, F> {
+            callback: &'a mut F,
+            panic: Option<Box<dyn std::any::Any + Send>>,
         }
-        _create_copy(self, driver, filename.as_ref(), options)
+
+        unsafe extern "C" fn progress<F: FnMut(f64) -> bool>(
+            complete: f64,
+            _message: *const std::ffi::c_char,
+            data: *mut std::ffi::c_void,
+        ) -> std::ffi::c_int {
+            let state = unsafe { &mut *(data as *mut Callback<'_, F>) };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (state.callback)(complete)
+            })) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(panic) => {
+                    state.panic = Some(panic);
+                    0
+                }
+            }
+        }
+
+        let c_filename = _path_to_c_string(filename.as_ref())?;
+        let mut state = Callback {
+            callback: &mut callback,
+            panic: None,
+        };
+        let c_dataset = unsafe {
+            gdal_sys::GDALCreateCopy(
+                driver.c_driver(),
+                c_filename.as_ptr(),
+                self.c_dataset,
+                0,
+                options.as_ptr(),
+                Some(progress::<F>),
+                &mut state as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+        if let Some(panic) = state.panic {
+            std::panic::resume_unwind(panic);
+        }
+        if c_dataset.is_null() {
+            return Err(_last_null_pointer_err("GDALCreateCopy"));
+        }
+        Ok(unsafe { Dataset::from_c_dataset(c_dataset) })
     }
 
     /// Fetch the driver to which this dataset relates.
